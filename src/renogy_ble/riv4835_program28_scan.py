@@ -1,13 +1,26 @@
-"""Read-only RIV4835CSH1S focused holding-register snapshot for Program 28.
+"""One-shot guarded RIV4835CSH1S Program 28 write validation.
 
-The exhaustive Program 28 = 0 A discovery found 1,235 readable holding
-registers outside the ranges already compared. This follow-up reads only those
-known-valid addresses so a Program 28 = 10 A snapshot can be captured in about
-one minute and compared with the 0 A baseline.
+Hardware discovery on the target inverter established this readback correlation
+for holding register 0xE205:
 
-This temporary hardware diagnostic sends Modbus function 0x03 read requests
-only. It never issues Modbus function 0x06/0x10 or any other device-setting
-write.
+    Program 28 =  0 A -> raw   0
+    Program 28 =  5 A -> raw  50
+    Program 28 = 10 A -> raw 100
+
+This temporary diagnostic performs exactly one guarded Modbus function 0x06
+write, and only when all preconditions are met:
+
+* exact model hint RIV4835CSH1S
+* exact target BLE address F0:F8:F2:57:47:0D
+* inverter Modbus device ID 0x20
+* fresh function-0x03 readback of 0xE205 equals 50 (physical Program 28 = 5 A)
+
+If those guards pass, it writes raw 100 to 0xE205 (10.0 A). The library's
+normal write_single_register path requires the CRC-valid function-0x06 response
+to echo the exact device ID, register, and value. The diagnostic then reads
+0xE205 back with function 0x03 and samples line-charging current at 0x113C.
+
+The write is never retried automatically and no rollback write is attempted.
 """
 
 from __future__ import annotations
@@ -16,6 +29,7 @@ import asyncio
 import logging
 
 from renogy_ble.ble import (
+    INVERTER_COMMAND_TIMEOUT,
     INVERTER_DEVICE_ID,
     INVERTER_INIT_CHAR_UUID,
     INVERTER_INIT_DELAY,
@@ -23,218 +37,56 @@ from renogy_ble.ble import (
     RenogyBLEDevice,
     RenogyBleClient,
     RenogyBleReadResult,
-    create_modbus_read_request,
-    modbus_crc,
 )
 
 logger = logging.getLogger(__name__)
 
-# Exact readable ranges discovered on this RIV4835CSH1S at Program 28 = 0 A.
-# Addresses in previously compared ranges are intentionally not repeated here.
-SCAN_RANGES: tuple[tuple[int, int], ...] = (
-    (0x000A, 0x0049),
-    (0x0100, 0x010F),
-    (0x0200, 0x0229),
-    (0x0438, 0x0438),
-    (0x0FAD, 0x1003),
-    (0x1019, 0x10CA),
-    (0x10EE, 0x1128),
-    (0xDF00, 0xDF0D),
-    (0xDF20, 0xDF61),
-    (0xE000, 0xE025),
-    (0xE100, 0xE131),
-    (0xE200, 0xE21B),
-    (0xF000, 0xF04D),
-    (0xF800, 0xFA01),
-)
-SCAN_TIMEOUT = 1.0
-SCAN_INTER_REQUEST_DELAY = 0.005
-PROGRESS_EVERY = 0x100
-LOG_VALUES_PER_LINE = 12
+TARGET_ADDRESS = "F0:F8:F2:57:47:0D"
+PROGRAM28_REGISTER = 0xE205
+EXPECTED_PRE_RAW = 50
+TARGET_RAW = 100
+LINE_CHARGING_CURRENT_REGISTER = 0x113C
+POST_WRITE_SETTLE_SECONDS = 1.5
 
-_PREFIX = "RIV4835 PROGRAM28 FOCUSED READ-ONLY SNAPSHOT"
+_PREFIX = "RIV4835 PROGRAM28 GUARDED WRITE TEST"
 _PATCH_MARKER = "_riv4835_program28_scan_installed"
-_SCAN_DONE_ATTR = "_riv4835_program28_scan_done"
+_ATTEMPTED_ATTR = "_riv4835_program28_guarded_write_attempted"
 
 
-def _extract_scan_frame(
-    notification_data: bytes | bytearray,
-) -> tuple[str, int] | None:
-    """Return a CRC-valid one-word read value or Modbus exception code."""
-    data = bytes(notification_data)
-
-    for offset in range(max(0, len(data) - 7), -1, -1):
-        if offset + 7 <= len(data):
-            candidate = data[offset : offset + 7]
-            if (
-                candidate[0] == INVERTER_DEVICE_ID
-                and candidate[1] == 0x03
-                and candidate[2] == 0x02
-            ):
-                crc_low, crc_high = modbus_crc(candidate[:-2])
-                if candidate[-2:] == bytes([crc_low, crc_high]):
-                    return ("value", int.from_bytes(candidate[3:5], "big"))
-
-        if offset + 5 <= len(data):
-            candidate = data[offset : offset + 5]
-            if candidate[0] == INVERTER_DEVICE_ID and candidate[1] == 0x83:
-                crc_low, crc_high = modbus_crc(candidate[:3])
-                if candidate[3:5] == bytes([crc_low, crc_high]):
-                    return ("exception", candidate[2])
-
-    return None
-
-
-async def _wait_for_scan_frame(session, *, timeout: float) -> tuple[str, int]:
-    """Wait for a validated normal or exception Modbus response."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-
-    while True:
-        frame = _extract_scan_frame(session.notification_data)
-        if frame is not None:
-            return frame
-
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            raise asyncio.TimeoutError()
-
-        await asyncio.wait_for(session.notification_event.wait(), remaining)
-        session.notification_event.clear()
-
-
-async def _initialize_inverter_session(
+async def _read_one_register(
     client: RenogyBleClient,
     device: RenogyBLEDevice,
-    session,
-) -> None:
-    """Connect and perform the same best-effort init as normal RIV polling."""
-    await client._ensure_session_ready(device, session)
-    if session.client is None:
-        raise RuntimeError("BLE session is not connected")
-
-    await asyncio.sleep(INVERTER_INIT_DELAY)
-    try:
-        await session.client.read_gatt_char(INVERTER_INIT_CHAR_UUID)
-    except Exception as exc:  # noqa: BLE001 - diagnostic best effort
-        logger.debug(
-            "RIV4835 focused scan init read failed for %s: %s",
-            device.name,
-            exc,
-        )
-
-
-async def _scan_one_register(
-    client: RenogyBleClient,
-    device: RenogyBLEDevice,
-    session,
     register: int,
-) -> tuple[str, int]:
-    """Read exactly one holding register using Modbus function 0x03."""
-    if session.client is None or not session.client.is_connected:
-        await _initialize_inverter_session(client, device, session)
-
-    client._reset_notifications(session)
-    request = create_modbus_read_request(INVERTER_DEVICE_ID, 0x03, register, 1)
-    await session.client.write_gatt_char(client._write_char_uuid, request)
-    return await _wait_for_scan_frame(session, timeout=SCAN_TIMEOUT)
-
-
-def _log_nonzero_values(snapshot: dict[int, int]) -> None:
-    """Log all nonzero values in compact grep-friendly batches."""
-    items = sorted((address, value) for address, value in snapshot.items() if value != 0)
-    for start in range(0, len(items), LOG_VALUES_PER_LINE):
-        batch = items[start : start + LOG_VALUES_PER_LINE]
-        logger.warning(
-            "%s VALUES %s",
-            _PREFIX,
-            " ".join(f"0x{address:04X}={value}" for address, value in batch),
-        )
-
-
-async def _scan_program28_candidates(
-    client: RenogyBleClient, device: RenogyBLEDevice
-) -> None:
-    """Capture the focused known-valid-address snapshot."""
-    done: set[str] = getattr(client, _SCAN_DONE_ATTR, set())
-    if device.address in done:
-        return
-    done.add(device.address)
-    setattr(client, _SCAN_DONE_ATTR, done)
-
-    snapshot: dict[int, int] = {}
-    exceptions: dict[int, int] = {}
-    timeouts: list[int] = []
-    scanned = 0
-    total = sum(end - start + 1 for start, end in SCAN_RANGES)
-
-    ranges_text = ",".join(
-        f"0x{start:04X}" if start == end else f"0x{start:04X}-0x{end:04X}"
-        for start, end in SCAN_RANGES
-    )
-    logger.warning(
-        "%s BEGIN device=%s addresses=%s ranges=%s",
-        _PREFIX,
-        device.address,
-        total,
-        ranges_text,
-    )
-
+) -> int:
+    """Read one holding register with function 0x03 and validated CRC framing."""
     session = await client._prepare_session(device)
     async with session.lock:
         try:
-            await _initialize_inverter_session(client, device, session)
+            await client._ensure_session_ready(device, session)
+            if session.client is None:
+                raise RuntimeError("BLE session is not connected")
 
-            for range_start, range_end in SCAN_RANGES:
-                for register in range(range_start, range_end + 1):
-                    try:
-                        response_type, response_value = await _scan_one_register(
-                            client, device, session, register
-                        )
-                    except asyncio.TimeoutError:
-                        timeouts.append(register)
-                        await client._close_session(
-                            device.address,
-                            device.name,
-                            session,
-                            remove=False,
-                        )
-                    except Exception as exc:  # noqa: BLE001 - non-fatal diagnostic
-                        logger.warning(
-                            "%s register 0x%04X failed: %s",
-                            _PREFIX,
-                            register,
-                            exc,
-                        )
-                        timeouts.append(register)
-                        await client._close_session(
-                            device.address,
-                            device.name,
-                            session,
-                            remove=False,
-                        )
-                    else:
-                        if response_type == "value":
-                            snapshot[register] = response_value
-                        else:
-                            exceptions[register] = response_value
+            await asyncio.sleep(INVERTER_INIT_DELAY)
+            try:
+                await session.client.read_gatt_char(INVERTER_INIT_CHAR_UUID)
+            except Exception as exc:  # noqa: BLE001 - same best-effort init as polling
+                logger.debug("%s init read failed: %s", _PREFIX, exc)
 
-                    scanned += 1
-                    if scanned % PROGRESS_EVERY == 0:
-                        logger.warning(
-                            "%s PROGRESS scanned=%s/%s values=%s exceptions=%s "
-                            "timeouts=%s current=0x%04X",
-                            _PREFIX,
-                            scanned,
-                            total,
-                            len(snapshot),
-                            len(exceptions),
-                            len(timeouts),
-                            register,
-                        )
+            response = await client._read_modbus_register(
+                session,
+                device_id=INVERTER_DEVICE_ID,
+                function_code=0x03,
+                register=register,
+                word_count=1,
+                cmd_name=f"guarded diagnostic register 0x{register:04X}",
+                device_name=device.name,
+                timeout=INVERTER_COMMAND_TIMEOUT,
+                retries=1,
+            )
+            if response is None or len(response) < 7:
+                raise RuntimeError(f"No valid read response for 0x{register:04X}")
 
-                    if SCAN_INTER_REQUEST_DELAY:
-                        await asyncio.sleep(SCAN_INTER_REQUEST_DELAY)
+            return int.from_bytes(response[3:5], "big")
         finally:
             await client._close_session(
                 device.address,
@@ -243,50 +95,209 @@ async def _scan_program28_candidates(
                 remove=False,
             )
 
-    _log_nonzero_values(snapshot)
 
-    if exceptions:
-        logger.warning(
-            "%s EXCEPTIONS %s",
-            _PREFIX,
-            ",".join(
-                f"0x{register:04X}:code{code}"
-                for register, code in sorted(exceptions.items())
-            ),
+async def _read_optional_line_current(
+    client: RenogyBleClient,
+    device: RenogyBLEDevice,
+    *,
+    phase: str,
+) -> int | None:
+    """Sample line-charging current raw value without affecting write guards."""
+    try:
+        return await _read_one_register(
+            client,
+            device,
+            LINE_CHARGING_CURRENT_REGISTER,
         )
+    except Exception as exc:  # noqa: BLE001 - informational telemetry only
+        logger.warning("%s %s line-current read unavailable: %s", _PREFIX, phase, exc)
+        return None
+
+
+async def _run_guarded_write_test(
+    client: RenogyBleClient,
+    device: RenogyBLEDevice,
+) -> None:
+    """Attempt one guarded 5 A -> 10 A Program 28 write and never retry it."""
+    attempted: set[str] = getattr(client, _ATTEMPTED_ATTR, set())
+    if device.address in attempted:
+        return
+
+    # Mark attempted before any I/O. A failed or partial test cannot cause a
+    # second automatic function-0x06 write on a later Home Assistant poll.
+    attempted.add(device.address)
+    setattr(client, _ATTEMPTED_ATTR, attempted)
+
+    if device.model_hint != RIV4835CSH1S_MODEL:
+        logger.error(
+            "%s ABORT model guard failed: got=%s expected=%s. NO WRITE SENT.",
+            _PREFIX,
+            device.model_hint,
+            RIV4835CSH1S_MODEL,
+        )
+        return
+
+    if device.address.upper() != TARGET_ADDRESS:
+        logger.error(
+            "%s ABORT address guard failed: got=%s expected=%s. NO WRITE SENT.",
+            _PREFIX,
+            device.address,
+            TARGET_ADDRESS,
+        )
+        return
+
+    if client._device_id != INVERTER_DEVICE_ID:
+        logger.error(
+            "%s ABORT Modbus-ID guard failed: got=0x%02X expected=0x%02X. "
+            "NO WRITE SENT.",
+            _PREFIX,
+            client._device_id,
+            INVERTER_DEVICE_ID,
+        )
+        return
 
     logger.warning(
-        "%s END device=%s scanned=%s values=%s zero_values=%s exceptions=%s "
-        "timeouts=%s",
+        "%s BEGIN model=%s address=%s register=0x%04X expected_pre_raw=%s "
+        "target_raw=%s",
         _PREFIX,
+        device.model_hint,
         device.address,
-        scanned,
-        len(snapshot),
-        sum(1 for value in snapshot.values() if value == 0),
-        len(exceptions),
-        ",".join(f"0x{register:04X}" for register in timeouts)
-        if timeouts
-        else "none",
+        PROGRAM28_REGISTER,
+        EXPECTED_PRE_RAW,
+        TARGET_RAW,
     )
+
+    try:
+        pre_raw = await _read_one_register(client, device, PROGRAM28_REGISTER)
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        logger.exception(
+            "%s ABORT pre-read failed: %s. NO WRITE SENT.",
+            _PREFIX,
+            exc,
+        )
+        return
+
+    line_before = await _read_optional_line_current(
+        client,
+        device,
+        phase="pre-write",
+    )
+
+    logger.warning(
+        "%s PRECHECK register=0x%04X raw=%s expected=%s line_charge_raw=%s",
+        _PREFIX,
+        PROGRAM28_REGISTER,
+        pre_raw,
+        EXPECTED_PRE_RAW,
+        line_before if line_before is not None else "unavailable",
+    )
+
+    if pre_raw != EXPECTED_PRE_RAW:
+        logger.error(
+            "%s ABORT precondition failed: 0x%04X=%s expected=%s. NO WRITE SENT.",
+            _PREFIX,
+            PROGRAM28_REGISTER,
+            pre_raw,
+            EXPECTED_PRE_RAW,
+        )
+        return
+
+    logger.warning(
+        "%s WRITE-SEND function=0x06 device_id=0x%02X register=0x%04X raw=%s "
+        "engineering=10.0A",
+        _PREFIX,
+        INVERTER_DEVICE_ID,
+        PROGRAM28_REGISTER,
+        TARGET_RAW,
+    )
+
+    # Exactly one function-0x06 send. write_single_register validates a CRC-correct
+    # exact echo of device ID, register, and raw value; it does not retry writes.
+    write_result = await client.write_single_register(
+        device,
+        PROGRAM28_REGISTER,
+        TARGET_RAW,
+        function_code=0x06,
+    )
+    if not write_result.success:
+        logger.error(
+            "%s RESULT FAIL write rejected/timeout: %s. No retry and no rollback "
+            "write will be sent.",
+            _PREFIX,
+            write_result.error,
+        )
+        return
+
+    logger.warning(
+        "%s WRITE-ECHO PASS register=0x%04X raw=%s exact_crc_valid_echo=true",
+        _PREFIX,
+        PROGRAM28_REGISTER,
+        TARGET_RAW,
+    )
+
+    await asyncio.sleep(POST_WRITE_SETTLE_SECONDS)
+
+    try:
+        readback_raw = await _read_one_register(client, device, PROGRAM28_REGISTER)
+    except Exception as exc:  # noqa: BLE001 - do not retry or roll back
+        logger.exception(
+            "%s RESULT FAIL post-write readback failed: %s. No retry and no "
+            "rollback write will be sent; verify LCD manually.",
+            _PREFIX,
+            exc,
+        )
+        return
+
+    line_after = await _read_optional_line_current(
+        client,
+        device,
+        phase="post-write",
+    )
+
+    if readback_raw != TARGET_RAW:
+        logger.error(
+            "%s RESULT FAIL readback 0x%04X=%s expected=%s. No retry and no "
+            "rollback write will be sent; verify LCD manually.",
+            _PREFIX,
+            PROGRAM28_REGISTER,
+            readback_raw,
+            TARGET_RAW,
+        )
+        return
+
+    logger.warning(
+        "%s RESULT PASS pre_raw=%s write_raw=%s readback_raw=%s "
+        "line_charge_before_raw=%s line_charge_after_raw=%s. "
+        "Verify physical LCD Program 28 now shows 10 A.",
+        _PREFIX,
+        pre_raw,
+        TARGET_RAW,
+        readback_raw,
+        line_before if line_before is not None else "unavailable",
+        line_after if line_after is not None else "unavailable",
+    )
+    logger.warning("%s END one_shot_complete=true", _PREFIX)
 
 
 def install_riv4835_program28_scan() -> None:
-    """Install the one-shot focused read-only diagnostic around RIV reads."""
+    """Install the one-shot guarded Program 28 write test around inverter reads."""
     if getattr(RenogyBleClient, _PATCH_MARKER, False):
         return
 
     original = RenogyBleClient._read_inverter_device
 
     async def _read_inverter_device(
-        self: RenogyBleClient, device: RenogyBLEDevice
+        self: RenogyBleClient,
+        device: RenogyBLEDevice,
     ) -> RenogyBleReadResult:
         result = await original(self, device)
         if device.model_hint == RIV4835CSH1S_MODEL:
             try:
-                await _scan_program28_candidates(self, device)
-            except Exception:  # noqa: BLE001 - never break normal telemetry
+                await _run_guarded_write_test(self, device)
+            except Exception:  # noqa: BLE001 - never break normal telemetry polling
                 logger.exception(
-                    "RIV4835 Program 28 focused read-only snapshot failed for %s",
+                    "%s unexpected wrapper failure for %s; no automatic retry",
+                    _PREFIX,
                     device.address,
                 )
         return result
