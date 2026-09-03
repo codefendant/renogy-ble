@@ -1,10 +1,13 @@
-"""Read-only RIV4835CSH1S holding-register discovery for Program 28.
+"""Read-only RIV4835CSH1S focused holding-register snapshot for Program 28.
+
+The exhaustive Program 28 = 0 A discovery found 1,235 readable holding
+registers outside the ranges already compared. This follow-up reads only those
+known-valid addresses so a Program 28 = 10 A snapshot can be captured in about
+one minute and compared with the 0 A baseline.
 
 This temporary hardware diagnostic sends Modbus function 0x03 read requests
 only. It never issues Modbus function 0x06/0x10 or any other device-setting
-write. The current pass exhaustively checks every address outside ranges already
-captured at both Program 28 = 0 A and 10 A, looking for model-specific holding
-registers that were absent from the published/reverse-engineered RIV-family map.
+write.
 """
 
 from __future__ import annotations
@@ -26,29 +29,30 @@ from renogy_ble.ble import (
 
 logger = logging.getLogger(__name__)
 
-# Already compared at Program 28 = 0 A and 10 A and therefore intentionally
-# omitted here:
-#   0x0FA0-0x0FAC
-#   0x1004-0x1018
-#   0x10CB-0x10ED
-#   0x1129-0x1333
-#
-# Together, the ranges below are every remaining 16-bit Modbus address.
+# Exact readable ranges discovered on this RIV4835CSH1S at Program 28 = 0 A.
+# Addresses in previously compared ranges are intentionally not repeated here.
 SCAN_RANGES: tuple[tuple[int, int], ...] = (
-    (0x0000, 0x0F9F),
+    (0x000A, 0x0049),
+    (0x0100, 0x010F),
+    (0x0200, 0x0229),
+    (0x0438, 0x0438),
     (0x0FAD, 0x1003),
     (0x1019, 0x10CA),
     (0x10EE, 0x1128),
-    (0x1334, 0xFFFF),
+    (0xDF00, 0xDF0D),
+    (0xDF20, 0xDF61),
+    (0xE000, 0xE025),
+    (0xE100, 0xE131),
+    (0xE200, 0xE21B),
+    (0xF000, 0xF04D),
+    (0xF800, 0xFA01),
 )
 SCAN_TIMEOUT = 1.0
-# The 9600-baud Modbus/BT-2 path already rate-limits each request naturally.
-# A very small cooperative pause keeps the HA event loop responsive without
-# materially extending this hour-scale exhaustive discovery pass.
 SCAN_INTER_REQUEST_DELAY = 0.005
-PROGRESS_EVERY = 0x1000
+PROGRESS_EVERY = 0x100
 LOG_VALUES_PER_LINE = 12
 
+_PREFIX = "RIV4835 PROGRAM28 FOCUSED READ-ONLY SNAPSHOT"
 _PATCH_MARKER = "_riv4835_program28_scan_installed"
 _SCAN_DONE_ATTR = "_riv4835_program28_scan_done"
 
@@ -59,8 +63,6 @@ def _extract_scan_frame(
     """Return a CRC-valid one-word read value or Modbus exception code."""
     data = bytes(notification_data)
 
-    # Search backward so the most recent complete frame wins if multiple
-    # notification fragments have accumulated.
     for offset in range(max(0, len(data) - 7), -1, -1):
         if offset + 7 <= len(data):
             candidate = data[offset : offset + 7]
@@ -116,7 +118,7 @@ async def _initialize_inverter_session(
         await session.client.read_gatt_char(INVERTER_INIT_CHAR_UUID)
     except Exception as exc:  # noqa: BLE001 - diagnostic best effort
         logger.debug(
-            "RIV4835 exhaustive scan init read failed for %s: %s",
+            "RIV4835 focused scan init read failed for %s: %s",
             device.name,
             exc,
         )
@@ -134,47 +136,18 @@ async def _scan_one_register(
 
     client._reset_notifications(session)
     request = create_modbus_read_request(INVERTER_DEVICE_ID, 0x03, register, 1)
-    # BLE characteristic writes are the transport for the Modbus READ request;
-    # the Modbus function in this frame is strictly 0x03.
     await session.client.write_gatt_char(client._write_char_uuid, request)
     return await _wait_for_scan_frame(session, timeout=SCAN_TIMEOUT)
 
 
-def _compress_addresses(addresses: list[int]) -> list[tuple[int, int]]:
-    """Compress sorted addresses into contiguous inclusive ranges."""
-    if not addresses:
-        return []
-
-    sorted_addresses = sorted(set(addresses))
-    ranges: list[tuple[int, int]] = []
-    start = previous = sorted_addresses[0]
-
-    for address in sorted_addresses[1:]:
-        if address == previous + 1:
-            previous = address
-            continue
-        ranges.append((start, previous))
-        start = previous = address
-
-    ranges.append((start, previous))
-    return ranges
-
-
-def _format_ranges(ranges: list[tuple[int, int]]) -> str:
-    """Format inclusive ranges compactly for logs."""
-    return ",".join(
-        f"0x{start:04X}" if start == end else f"0x{start:04X}-0x{end:04X}"
-        for start, end in ranges
-    ) or "none"
-
-
 def _log_nonzero_values(snapshot: dict[int, int]) -> None:
-    """Log only nonzero discovered values in compact grep-friendly batches."""
+    """Log all nonzero values in compact grep-friendly batches."""
     items = sorted((address, value) for address, value in snapshot.items() if value != 0)
     for start in range(0, len(items), LOG_VALUES_PER_LINE):
         batch = items[start : start + LOG_VALUES_PER_LINE]
         logger.warning(
-            "RIV4835 PROGRAM28 FULL READ-ONLY DISCOVERY VALUES %s",
+            "%s VALUES %s",
+            _PREFIX,
             " ".join(f"0x{address:04X}={value}" for address, value in batch),
         )
 
@@ -182,7 +155,7 @@ def _log_nonzero_values(snapshot: dict[int, int]) -> None:
 async def _scan_program28_candidates(
     client: RenogyBleClient, device: RenogyBLEDevice
 ) -> None:
-    """Exhaustively discover previously unknown readable holding registers."""
+    """Capture the focused known-valid-address snapshot."""
     done: set[str] = getattr(client, _SCAN_DONE_ATTR, set())
     if device.address in done:
         return
@@ -190,19 +163,18 @@ async def _scan_program28_candidates(
     setattr(client, _SCAN_DONE_ATTR, done)
 
     snapshot: dict[int, int] = {}
-    valid_addresses: list[int] = []
-    illegal_count = 0
-    other_exceptions: dict[int, int] = {}
+    exceptions: dict[int, int] = {}
     timeouts: list[int] = []
     scanned = 0
     total = sum(end - start + 1 for start, end in SCAN_RANGES)
 
     ranges_text = ",".join(
-        f"0x{start:04X}-0x{end:04X}" for start, end in SCAN_RANGES
+        f"0x{start:04X}" if start == end else f"0x{start:04X}-0x{end:04X}"
+        for start, end in SCAN_RANGES
     )
     logger.warning(
-        "RIV4835 PROGRAM28 FULL READ-ONLY DISCOVERY BEGIN device=%s "
-        "addresses=%s ranges=%s",
+        "%s BEGIN device=%s addresses=%s ranges=%s",
+        _PREFIX,
         device.address,
         total,
         ranges_text,
@@ -221,8 +193,6 @@ async def _scan_program28_candidates(
                         )
                     except asyncio.TimeoutError:
                         timeouts.append(register)
-                        # A late response cannot safely be matched to the next
-                        # address, so reconnect before continuing.
                         await client._close_session(
                             device.address,
                             device.name,
@@ -231,8 +201,8 @@ async def _scan_program28_candidates(
                         )
                     except Exception as exc:  # noqa: BLE001 - non-fatal diagnostic
                         logger.warning(
-                            "RIV4835 PROGRAM28 FULL READ-ONLY DISCOVERY register "
-                            "0x%04X failed: %s",
+                            "%s register 0x%04X failed: %s",
+                            _PREFIX,
                             register,
                             exc,
                         )
@@ -245,22 +215,20 @@ async def _scan_program28_candidates(
                         )
                     else:
                         if response_type == "value":
-                            valid_addresses.append(register)
                             snapshot[register] = response_value
-                        elif response_value == 2:
-                            illegal_count += 1
                         else:
-                            other_exceptions[register] = response_value
+                            exceptions[register] = response_value
 
                     scanned += 1
                     if scanned % PROGRESS_EVERY == 0:
                         logger.warning(
-                            "RIV4835 PROGRAM28 FULL READ-ONLY DISCOVERY PROGRESS "
-                            "scanned=%s/%s valid=%s illegal=%s timeouts=%s current=0x%04X",
+                            "%s PROGRESS scanned=%s/%s values=%s exceptions=%s "
+                            "timeouts=%s current=0x%04X",
+                            _PREFIX,
                             scanned,
                             total,
-                            len(valid_addresses),
-                            illegal_count,
+                            len(snapshot),
+                            len(exceptions),
                             len(timeouts),
                             register,
                         )
@@ -275,30 +243,27 @@ async def _scan_program28_candidates(
                 remove=False,
             )
 
-    valid_ranges = _compress_addresses(valid_addresses)
-    logger.warning(
-        "RIV4835 PROGRAM28 FULL READ-ONLY DISCOVERY VALID-RANGES %s",
-        _format_ranges(valid_ranges),
-    )
     _log_nonzero_values(snapshot)
 
-    if other_exceptions:
+    if exceptions:
         logger.warning(
-            "RIV4835 PROGRAM28 FULL READ-ONLY DISCOVERY EXCEPTIONS %s",
+            "%s EXCEPTIONS %s",
+            _PREFIX,
             ",".join(
                 f"0x{register:04X}:code{code}"
-                for register, code in sorted(other_exceptions.items())
+                for register, code in sorted(exceptions.items())
             ),
         )
 
     logger.warning(
-        "RIV4835 PROGRAM28 FULL READ-ONLY DISCOVERY END device=%s scanned=%s "
-        "valid=%s zero_valid=%s illegal=%s timeouts=%s",
+        "%s END device=%s scanned=%s values=%s zero_values=%s exceptions=%s "
+        "timeouts=%s",
+        _PREFIX,
         device.address,
         scanned,
-        len(valid_addresses),
+        len(snapshot),
         sum(1 for value in snapshot.values() if value == 0),
-        illegal_count,
+        len(exceptions),
         ",".join(f"0x{register:04X}" for register in timeouts)
         if timeouts
         else "none",
@@ -306,7 +271,7 @@ async def _scan_program28_candidates(
 
 
 def install_riv4835_program28_scan() -> None:
-    """Install the one-shot exhaustive read-only diagnostic around RIV reads."""
+    """Install the one-shot focused read-only diagnostic around RIV reads."""
     if getattr(RenogyBleClient, _PATCH_MARKER, False):
         return
 
@@ -321,7 +286,7 @@ def install_riv4835_program28_scan() -> None:
                 await _scan_program28_candidates(self, device)
             except Exception:  # noqa: BLE001 - never break normal telemetry
                 logger.exception(
-                    "RIV4835 Program 28 exhaustive read-only discovery failed for %s",
+                    "RIV4835 Program 28 focused read-only snapshot failed for %s",
                     device.address,
                 )
         return result
