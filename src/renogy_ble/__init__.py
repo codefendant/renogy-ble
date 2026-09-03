@@ -40,6 +40,7 @@ from renogy_ble.hub import (
     RenogyHubBatteryReadResult,
 )
 from renogy_ble.renogy_parser import RenogyParser
+from renogy_ble.riv4835_program28_readback import install_riv4835_program28_readback
 from renogy_ble.shunt import (
     KEY_SHUNT_CURRENT,
     KEY_SHUNT_ENERGY_CHARGED_TOTAL,
@@ -50,6 +51,11 @@ from renogy_ble.shunt import (
     ShuntBleClient,
     parse_shunt_payload,
 )
+
+# Temporary hardware-validation shim: make RIV4835CSH1S polls include
+# Program 28 register 0x1146 so the exact register value can be compared with
+# the inverter LCD before relying on writes.
+install_riv4835_program28_readback()
 
 # Set up logging
 logging.basicConfig(
