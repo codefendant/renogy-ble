@@ -52,8 +52,10 @@ from renogy_ble.shunt import (
     parse_shunt_payload,
 )
 
-# Temporary hardware-validation diagnostic. It performs one focused holding-
-# register snapshot for RIV4835CSH1S devices using Modbus function 0x03 only.
+# Temporary hardware-validation diagnostic. On the exact target RIV4835CSH1S
+# only, it performs one guarded Program 28 function-0x06 write from a verified
+# 5 A readback to 10 A, then validates function-0x03 readback. It never retries
+# the write automatically and never sends a rollback write.
 install_riv4835_program28_scan()
 
 # Set up logging
