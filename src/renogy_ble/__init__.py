@@ -40,6 +40,7 @@ from renogy_ble.hub import (
     RenogyHubBatteryReadResult,
 )
 from renogy_ble.renogy_parser import RenogyParser
+from renogy_ble.riv4835_program28_scan import install_riv4835_program28_scan
 from renogy_ble.shunt import (
     KEY_SHUNT_CURRENT,
     KEY_SHUNT_ENERGY_CHARGED_TOTAL,
@@ -50,6 +51,10 @@ from renogy_ble.shunt import (
     ShuntBleClient,
     parse_shunt_payload,
 )
+
+# Temporary hardware-validation diagnostic. It performs one focused holding-
+# register snapshot for RIV4835CSH1S devices using Modbus function 0x03 only.
+install_riv4835_program28_scan()
 
 # Set up logging
 logging.basicConfig(
