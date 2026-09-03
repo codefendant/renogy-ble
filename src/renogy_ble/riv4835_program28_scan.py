@@ -23,12 +23,14 @@ from renogy_ble.ble import (
 
 logger = logging.getLogger(__name__)
 
-# Continue just beyond the first snapshot. Registers through 0x1160 were already
-# captured at both Program 28 = 10 A and 0 A; no persistent configuration field
-# in that range tracked the setting. The earlier 8-word read beginning at 0x1161
-# failed as a block, so this pass isolates unsupported addresses and continues.
-SCAN_START = 0x1161
-SCAN_END = 0x1195
+# Candidate RIV-family blocks not yet compared on this exact RIV4835CSH1S.
+# 0x1129-0x1195 has already been tested at Program 28 = 0 A and 10 A and did
+# not contain a readable persistent field that tracked the setting.
+SCAN_RANGES: tuple[tuple[int, int], ...] = (
+    (0x0FA0, 0x0FAC),
+    (0x1004, 0x1018),
+    (0x10CB, 0x10E6),
+)
 SCAN_CHUNK_WORDS = 8
 SCAN_TIMEOUT = 2.0
 SCAN_INTER_REQUEST_DELAY = 0.20
@@ -64,7 +66,6 @@ async def _read_candidate_range(
             if session.client is None:
                 raise RuntimeError("BLE session is not connected")
 
-            # Match the validated RIV read path's initialization sequence.
             await asyncio.sleep(INVERTER_INIT_DELAY)
             try:
                 await session.client.read_gatt_char(INVERTER_INIT_CHAR_UUID)
@@ -90,9 +91,8 @@ async def _read_candidate_range(
                 retries=1,
             )
         finally:
-            # Every candidate read is isolated. This is intentionally slower but
-            # guarantees that a timeout/late reply cannot contaminate the next
-            # register request. The normal coordinator will reconnect afterward.
+            # Isolate every candidate request so a timeout or late response can
+            # never contaminate the next address range.
             await client._close_session(
                 device.address,
                 device.name,
@@ -101,29 +101,18 @@ async def _read_candidate_range(
             )
 
 
-async def _scan_program28_candidates(
-    client: RenogyBleClient, device: RenogyBLEDevice
+async def _scan_block(
+    client: RenogyBleClient,
+    device: RenogyBLEDevice,
+    block_start: int,
+    block_end: int,
+    snapshot: dict[int, int],
+    missing_registers: list[int],
 ) -> None:
-    """Capture and log one raw candidate-register snapshot."""
-    done: set[str] = getattr(client, _SCAN_DONE_ATTR, set())
-    if device.address in done:
-        return
-    done.add(device.address)
-    setattr(client, _SCAN_DONE_ATTR, done)
-
-    snapshot: dict[int, int] = {}
-    missing_registers: list[int] = []
-
-    logger.warning(
-        "RIV4835 PROGRAM28 READ-ONLY SNAPSHOT BEGIN device=%s range=0x%04X-0x%04X",
-        device.address,
-        SCAN_START,
-        SCAN_END,
-    )
-
-    start = SCAN_START
-    while start <= SCAN_END:
-        count = min(SCAN_CHUNK_WORDS, SCAN_END - start + 1)
+    """Scan one candidate block, falling back to individual reads on failures."""
+    start = block_start
+    while start <= block_end:
+        count = min(SCAN_CHUNK_WORDS, block_end - start + 1)
         try:
             response = await _read_candidate_range(client, device, start, count)
         except Exception as exc:  # noqa: BLE001 - non-fatal diagnostic
@@ -146,9 +135,6 @@ async def _scan_program28_candidates(
                 ),
             )
         else:
-            # One unsupported address can make a contiguous Modbus block fail.
-            # Probe each word separately so valid registers on either side are
-            # still captured, always with fresh sessions.
             logger.warning(
                 "RIV4835 PROGRAM28 READ-ONLY SNAPSHOT retrying block "
                 "0x%04X-0x%04X one register at a time",
@@ -185,8 +171,41 @@ async def _scan_program28_candidates(
                 )
 
         start += count
-        if start <= SCAN_END:
+        if start <= block_end:
             await asyncio.sleep(SCAN_INTER_REQUEST_DELAY)
+
+
+async def _scan_program28_candidates(
+    client: RenogyBleClient, device: RenogyBLEDevice
+) -> None:
+    """Capture and log one raw candidate-register snapshot."""
+    done: set[str] = getattr(client, _SCAN_DONE_ATTR, set())
+    if device.address in done:
+        return
+    done.add(device.address)
+    setattr(client, _SCAN_DONE_ATTR, done)
+
+    snapshot: dict[int, int] = {}
+    missing_registers: list[int] = []
+    ranges_text = ",".join(
+        f"0x{start:04X}-0x{end:04X}" for start, end in SCAN_RANGES
+    )
+
+    logger.warning(
+        "RIV4835 PROGRAM28 READ-ONLY SNAPSHOT BEGIN device=%s ranges=%s",
+        device.address,
+        ranges_text,
+    )
+
+    for block_start, block_end in SCAN_RANGES:
+        await _scan_block(
+            client,
+            device,
+            block_start,
+            block_end,
+            snapshot,
+            missing_registers,
+        )
 
     logger.warning(
         "RIV4835 PROGRAM28 READ-ONLY SNAPSHOT END device=%s registers=%s missing=%s",
