@@ -23,13 +23,15 @@ from renogy_ble.ble import (
 
 logger = logging.getLogger(__name__)
 
-# Focused configuration window. It contains the known RIV load/config area and
-# deliberately extends around 0x1146 without sweeping the entire address space.
-SCAN_START = 0x1129
+# Continue just beyond the first snapshot. Registers through 0x1160 were already
+# captured at both Program 28 = 10 A and 0 A; no persistent configuration field
+# in that range tracked the setting. The earlier 8-word read beginning at 0x1161
+# failed as a block, so this pass isolates unsupported addresses and continues.
+SCAN_START = 0x1161
 SCAN_END = 0x1195
 SCAN_CHUNK_WORDS = 8
 SCAN_TIMEOUT = 2.0
-SCAN_INTER_CHUNK_DELAY = 0.20
+SCAN_INTER_REQUEST_DELAY = 0.20
 
 _PATCH_MARKER = "_riv4835_program28_scan_installed"
 _SCAN_DONE_ATTR = "_riv4835_program28_scan_done"
@@ -47,6 +49,58 @@ def _decode_registers(start_register: int, response: bytes) -> dict[int, int]:
     return values
 
 
+async def _read_candidate_range(
+    client: RenogyBleClient,
+    device: RenogyBLEDevice,
+    start_register: int,
+    word_count: int,
+) -> bytes | None:
+    """Read one candidate range using function 0x03 only on an isolated session."""
+    session = await client._prepare_session(device)
+
+    async with session.lock:
+        try:
+            await client._ensure_session_ready(device, session)
+            if session.client is None:
+                raise RuntimeError("BLE session is not connected")
+
+            # Match the validated RIV read path's initialization sequence.
+            await asyncio.sleep(INVERTER_INIT_DELAY)
+            try:
+                await session.client.read_gatt_char(INVERTER_INIT_CHAR_UUID)
+            except Exception as exc:  # noqa: BLE001 - diagnostic best effort
+                logger.debug(
+                    "RIV4835 candidate scan init read failed for %s: %s",
+                    device.name,
+                    exc,
+                )
+
+            return await client._read_modbus_register(
+                session,
+                device_id=INVERTER_DEVICE_ID,
+                function_code=0x03,
+                register=start_register,
+                word_count=word_count,
+                cmd_name=(
+                    "RIV4835 Program 28 read-only candidate scan "
+                    f"0x{start_register:04X}"
+                ),
+                device_name=device.name,
+                timeout=SCAN_TIMEOUT,
+                retries=1,
+            )
+        finally:
+            # Every candidate read is isolated. This is intentionally slower but
+            # guarantees that a timeout/late reply cannot contaminate the next
+            # register request. The normal coordinator will reconnect afterward.
+            await client._close_session(
+                device.address,
+                device.name,
+                session,
+                remove=True,
+            )
+
+
 async def _scan_program28_candidates(
     client: RenogyBleClient, device: RenogyBLEDevice
 ) -> None:
@@ -58,8 +112,7 @@ async def _scan_program28_candidates(
     setattr(client, _SCAN_DONE_ATTR, done)
 
     snapshot: dict[int, int] = {}
-    missing_ranges: list[str] = []
-    session = await client._prepare_session(device)
+    missing_registers: list[int] = []
 
     logger.warning(
         "RIV4835 PROGRAM28 READ-ONLY SNAPSHOT BEGIN device=%s range=0x%04X-0x%04X",
@@ -68,91 +121,80 @@ async def _scan_program28_candidates(
         SCAN_END,
     )
 
-    async with session.lock:
+    start = SCAN_START
+    while start <= SCAN_END:
+        count = min(SCAN_CHUNK_WORDS, SCAN_END - start + 1)
         try:
-            await client._ensure_session_ready(device, session)
-            if session.client is None:
-                raise RuntimeError("BLE session is not connected")
+            response = await _read_candidate_range(client, device, start, count)
+        except Exception as exc:  # noqa: BLE001 - non-fatal diagnostic
+            logger.warning(
+                "RIV4835 PROGRAM28 READ-ONLY SNAPSHOT block 0x%04X-0x%04X failed: %s",
+                start,
+                start + count - 1,
+                exc,
+            )
+            response = None
 
-            # Match the validated RIV read path's initialization sequence once,
-            # then keep the same BLE/notification session for the whole snapshot.
-            await asyncio.sleep(INVERTER_INIT_DELAY)
-            try:
-                await session.client.read_gatt_char(INVERTER_INIT_CHAR_UUID)
-            except Exception as exc:  # noqa: BLE001 - diagnostic best effort
-                logger.debug(
-                    "RIV4835 candidate scan init read failed for %s: %s",
-                    device.name,
-                    exc,
-                )
-
-            start = SCAN_START
-            while start <= SCAN_END:
-                count = min(SCAN_CHUNK_WORDS, SCAN_END - start + 1)
+        if response is not None:
+            values = _decode_registers(start, response)
+            snapshot.update(values)
+            logger.warning(
+                "RIV4835 PROGRAM28 READ-ONLY SNAPSHOT %s",
+                " ".join(
+                    f"0x{register:04X}={value}"
+                    for register, value in sorted(values.items())
+                ),
+            )
+        else:
+            # One unsupported address can make a contiguous Modbus block fail.
+            # Probe each word separately so valid registers on either side are
+            # still captured, always with fresh sessions.
+            logger.warning(
+                "RIV4835 PROGRAM28 READ-ONLY SNAPSHOT retrying block "
+                "0x%04X-0x%04X one register at a time",
+                start,
+                start + count - 1,
+            )
+            recovered: dict[int, int] = {}
+            for register in range(start, start + count):
                 try:
-                    response = await client._read_modbus_register(
-                        session,
-                        device_id=INVERTER_DEVICE_ID,
-                        function_code=0x03,
-                        register=start,
-                        word_count=count,
-                        cmd_name=(
-                            "RIV4835 Program 28 read-only candidate scan "
-                            f"0x{start:04X}"
-                        ),
-                        device_name=device.name,
-                        timeout=SCAN_TIMEOUT,
-                        retries=1,
-                    )
+                    single = await _read_candidate_range(client, device, register, 1)
                 except Exception as exc:  # noqa: BLE001 - non-fatal diagnostic
                     logger.warning(
-                        "RIV4835 PROGRAM28 READ-ONLY SNAPSHOT chunk "
-                        "0x%04X-0x%04X failed: %s",
-                        start,
-                        start + count - 1,
+                        "RIV4835 PROGRAM28 READ-ONLY SNAPSHOT register "
+                        "0x%04X failed: %s",
+                        register,
                         exc,
                     )
-                    response = None
+                    single = None
 
-                if response is None:
-                    missing_ranges.append(
-                        f"0x{start:04X}-0x{start + count - 1:04X}"
-                    )
-                    # A timed-out read leaves the response stream ambiguous.
-                    # Stop rather than risk associating a late response with a
-                    # different register request.
-                    if session.desynchronized:
-                        break
+                if single is None:
+                    missing_registers.append(register)
                 else:
-                    values = _decode_registers(start, response)
-                    snapshot.update(values)
-                    logger.warning(
-                        "RIV4835 PROGRAM28 READ-ONLY SNAPSHOT %s",
-                        " ".join(
-                            f"0x{register:04X}={value}"
-                            for register, value in sorted(values.items())
-                        ),
-                    )
+                    recovered.update(_decode_registers(register, single))
+                await asyncio.sleep(SCAN_INTER_REQUEST_DELAY)
 
-                start += count
-                if start <= SCAN_END:
-                    await asyncio.sleep(SCAN_INTER_CHUNK_DELAY)
-        finally:
-            # The scanner is one-shot. Close its session in intermittent mode,
-            # or force-close a desynchronized persistent session.
-            if session.desynchronized or client._transport_mode != "persistent_session":
-                await client._close_session(
-                    device.address,
-                    device.name,
-                    session,
-                    remove=session.desynchronized,
+            if recovered:
+                snapshot.update(recovered)
+                logger.warning(
+                    "RIV4835 PROGRAM28 READ-ONLY SNAPSHOT %s",
+                    " ".join(
+                        f"0x{register:04X}={value}"
+                        for register, value in sorted(recovered.items())
+                    ),
                 )
+
+        start += count
+        if start <= SCAN_END:
+            await asyncio.sleep(SCAN_INTER_REQUEST_DELAY)
 
     logger.warning(
         "RIV4835 PROGRAM28 READ-ONLY SNAPSHOT END device=%s registers=%s missing=%s",
         device.address,
         len(snapshot),
-        ",".join(missing_ranges) if missing_ranges else "none",
+        ",".join(f"0x{register:04X}" for register in missing_registers)
+        if missing_registers
+        else "none",
     )
 
 
