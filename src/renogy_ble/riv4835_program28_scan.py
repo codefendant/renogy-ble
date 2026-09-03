@@ -14,19 +14,22 @@ write, and only when all preconditions are met:
 * exact target BLE address F0:F8:F2:57:47:0D
 * inverter Modbus device ID 0x20
 * fresh function-0x03 readback of 0xE205 equals 50 (physical Program 28 = 5 A)
+* a persistent one-shot sentinel can be created before the write
 
 If those guards pass, it writes raw 100 to 0xE205 (10.0 A). The library's
 normal write_single_register path requires the CRC-valid function-0x06 response
 to echo the exact device ID, register, and value. The diagnostic then reads
 0xE205 back with function 0x03 and samples line-charging current at 0x113C.
 
-The write is never retried automatically and no rollback write is attempted.
+The write is never retried automatically, even across Home Assistant restarts,
+and no rollback write is attempted.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 
 from renogy_ble.ble import (
     INVERTER_COMMAND_TIMEOUT,
@@ -47,6 +50,7 @@ EXPECTED_PRE_RAW = 50
 TARGET_RAW = 100
 LINE_CHARGING_CURRENT_REGISTER = 0x113C
 POST_WRITE_SETTLE_SECONDS = 1.5
+SENTINEL_PATH = Path("/config/.renogy_program28_e205_5a_to_10a_attempted")
 
 _PREFIX = "RIV4835 PROGRAM28 GUARDED WRITE TEST"
 _PATCH_MARKER = "_riv4835_program28_scan_installed"
@@ -114,6 +118,35 @@ async def _read_optional_line_current(
         return None
 
 
+def _claim_persistent_one_shot() -> bool:
+    """Atomically claim this exact hardware write test across HA restarts."""
+    if SENTINEL_PATH.exists():
+        return False
+
+    try:
+        # Exclusive creation prevents a second concurrent/process attempt.
+        with SENTINEL_PATH.open("x", encoding="utf-8") as sentinel:
+            sentinel.write(
+                "RIV4835CSH1S Program 28 guarded test\n"
+                "register=0xE205\n"
+                "pre_raw=50\n"
+                "target_raw=100\n"
+            )
+    except FileExistsError:
+        return False
+    except OSError as exc:
+        logger.error(
+            "%s ABORT could not create persistent one-shot sentinel %s: %s. "
+            "NO WRITE SENT.",
+            _PREFIX,
+            SENTINEL_PATH,
+            exc,
+        )
+        return False
+
+    return True
+
+
 async def _run_guarded_write_test(
     client: RenogyBleClient,
     device: RenogyBLEDevice,
@@ -123,8 +156,7 @@ async def _run_guarded_write_test(
     if device.address in attempted:
         return
 
-    # Mark attempted before any I/O. A failed or partial test cannot cause a
-    # second automatic function-0x06 write on a later Home Assistant poll.
+    # Prevent repeated attempts during this process even before persistent claim.
     attempted.add(device.address)
     setattr(client, _ATTEMPTED_ATTR, attempted)
 
@@ -153,6 +185,15 @@ async def _run_guarded_write_test(
             _PREFIX,
             client._device_id,
             INVERTER_DEVICE_ID,
+        )
+        return
+
+    if SENTINEL_PATH.exists():
+        logger.warning(
+            "%s SKIP persistent one-shot sentinel already exists at %s. "
+            "NO WRITE SENT.",
+            _PREFIX,
+            SENTINEL_PATH,
         )
         return
 
@@ -202,13 +243,23 @@ async def _run_guarded_write_test(
         )
         return
 
+    # Claim the test persistently before sending function 0x06. If HA crashes or
+    # the BLE response is lost, a restart still cannot resend this write.
+    if not _claim_persistent_one_shot():
+        logger.error(
+            "%s ABORT persistent one-shot claim failed/already exists. NO WRITE SENT.",
+            _PREFIX,
+        )
+        return
+
     logger.warning(
         "%s WRITE-SEND function=0x06 device_id=0x%02X register=0x%04X raw=%s "
-        "engineering=10.0A",
+        "engineering=10.0A sentinel=%s",
         _PREFIX,
         INVERTER_DEVICE_ID,
         PROGRAM28_REGISTER,
         TARGET_RAW,
+        SENTINEL_PATH,
     )
 
     # Exactly one function-0x06 send. write_single_register validates a CRC-correct
