@@ -1001,6 +1001,68 @@ class RenogyBleClient:
             _InverterReadSpec(4452, 1, "_parse_inverter_over_voltage"),
         )
 
+    async def read_inverter_diagnostics(
+        self, device: RenogyBLEDevice
+    ) -> dict[str, Any]:
+        """Opt in to read-only, protocol-documented RIV diagnostic registers.
+
+        This is separate from normal polling. A failed diagnostic block never
+        changes ordinary telemetry or the device's availability. Timed-out
+        sessions are discarded before reading another block.
+        """
+        from .inverter_diagnostics import READ_BLOCKS, parse_snapshot
+
+        if device.device_type != "inverter" or device.model_hint != RIV4835CSH1S_MODEL:
+            raise ValueError("Inverter diagnostics require the RIV4835CSH1S profile")
+
+        words: dict[int, int] = {}
+        errors: dict[str, str] = {}
+        for register, count in READ_BLOCKS:
+            session = await self._prepare_session(device)
+            async with session.lock:
+                completed = False
+                try:
+                    await self._ensure_session_ready(device, session)
+                    if session.client is None:
+                        raise RuntimeError("BLE session is not connected")
+                    await asyncio.sleep(INVERTER_INIT_DELAY)
+                    try:
+                        await session.client.read_gatt_char(INVERTER_INIT_CHAR_UUID)
+                    except Exception:
+                        logger.debug("Optional inverter init read unavailable")
+                    response = await self._read_modbus_register(
+                        session,
+                        device_id=INVERTER_DEVICE_ID,
+                        function_code=0x03,
+                        register=register,
+                        word_count=count,
+                        cmd_name=f"RIV diagnostics {register}",
+                        device_name=device.name,
+                        timeout=2.0,
+                        retries=1,
+                    )
+                    if response is None:
+                        raise TimeoutError("No valid diagnostic response")
+                    words.update(
+                        {
+                            register + index: int.from_bytes(
+                                response[3 + index * 2 : 5 + index * 2], "big"
+                            )
+                            for index in range(count)
+                        }
+                    )
+                    completed = True
+                except Exception as exc:
+                    errors[str(register)] = str(exc)
+                finally:
+                    if not completed or self._transport_mode != "persistent_session":
+                        await self._close_session(
+                            device.address, device.name, session, remove=not completed
+                        )
+            await asyncio.sleep(INVERTER_INTER_COMMAND_DELAY)
+
+        return parse_snapshot(words, errors)
+
     async def _read_inverter_device(
         self, device: RenogyBLEDevice
     ) -> RenogyBleReadResult:
